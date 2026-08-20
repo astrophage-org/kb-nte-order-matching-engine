@@ -1,42 +1,61 @@
-# Kafka Publisher
+<!-- anchor: internal/events/kafka_publisher.go:L1-L100 sha:HEAD -->
 
-The **[[entities/kafka-publisher]]** serves as the core implementation of the **`Egress & Messaging Gateway`** layer within the [[summaries/order-matching-system]]. It provides a high-level abstraction for broadcasting internal system events to external consumers while isolating the core matching logic from infrastructure-specific details.
+# KafkaPublisher and Producer Tuning
 
-## Role in Architecture
-In accordance with the [[decisions/decoupling-strategy]], the Kafka Publisher ensures that the **`concepts/execution_logic_order_books`** and the **`concepts/domain-orchestration_engine`** remain "pure." These components do not interact with Kafka directly; instead, they produce internal events which are then passed to the publisher.
+The `KafkaPublisher` component (`internal/events/kafka_publisher.go`) manages asynchronous event broadcasting from the Order Matching Engine (OME) to the core event broker cluster. It wraps the `confluent-kafka-go` producer library, translating internal execution and state changes into structured JSON payloads dispatched across specialized Kafka topics.
 
-This abstraction allows the system to:
-1.  Isolate infrastructure failures (e.g., network issues with a broker) from the execution of the matching engine.
-2.  Facilitate easier testing by allowing for mock implementations of the publisher during CI/CD.
-3.  Provide a centralized point for event serialization and mapping to external schemas.
+For a broader view of asynchronous messaging across the platform, see [[concepts/event-driven-architecture]] and [[decisions/sister-system-integration]].
 
-## Data Flow & Pipeline
-The component is the final stage in the **`summaries/data_flow_pipeline`**. Once an order is successfully processed through the `concepts/domain-orchestration_engine`, any resulting trade executions or state changes are passed to this entity for publication.
+---
 
-## Technical Specifications
+## Responsibilities
 
-### Broker Configuration
-The producer is initialized with specific configurations optimized for high-performance financial data:
-*   **Acknowledge (acks):** Set to `all` to ensure maximum reliability for trade settlement.
-*   **Linger.ms:** Optimized for low latency while allowing for slight batching of events.
-*   **Partitioning:** Snapshots are partitioned by the asset symbol to maintain order and locality for downstream consumers.
+*   **Producer Initialization & Configuration**: Connects to the Kafka broker cluster using low-latency tuning parameters.
+*   **Trade Execution Broadcasting**: Serializes and publishes matched trade execution payloads (`models.TradeExecution`) to the `nte.trades.matched` topic for downstream clearing, settlement, and compliance monitoring.
+*   **Order Book Snapshot Publishing**: Marshals and broadcasts Level 2 (L2) book snapshots to the `nte.orderbook.snapshots` topic, keyed by trading symbols for partition-safe consumption by market data gateways.
+*   **Resilient Fallback Handling**: Integrates with the application startup lifecycle (`cmd/server/main.go`) to allow graceful degradation into standalone/development mode if broker connections cannot be established (see [[decisions/resilient-event-integration]]).
 
-### Broadcast Methods
+---
 
-#### Trade Publication (`PublishTrades`)
-This method broadcasts successful match results to the `nte.trades.matched` topic. 
-- **Internal Source:** `models.TradeExecution`
-- **Downstream Consumers:** 
-    - `trade-settlement-system` (for post-trade clearing)
-    - `compliance-surveillance-monitor` (for fraud and wash-trading detection)
+## Dependencies
 
-#### Snapshot Publication (`PublishSnapshot`)
-This method broadcasts L2 order book snapshots to the `nte.orderbook.snapshots` topic.
-- **Internal Source:** Generic snapshot object/map.
-- **Downstream Consumers:** 
-    - `market-data-gateway` (for broadcasting market depth to clients).
+*   `github.com/confluentinc/confluent-kafka-go/v2/kafka`: The underlying C-backed Confluent Kafka Go client used for high-throughput message production.
+*   `github.com/sirupsen/logrus`: Provides structured JSON logging for producer errors, marshaling failures, and connection status.
+*   `github.com/Astrophage/order-matching-engine/models`: Supplies domain types such as `models.TradeExecution` for serialization.
+*   Sister systems consuming published events:
+    *   [[entities/engine]] / [[entities/order-book]]: Generates the trades and state mutations that trigger publishing.
+    *   `trade-settlement-system` and `compliance-surveillance-monitor`: Consume `nte.trades.matched`.
+    *   `market-data-gateway`: Consumes `nte.orderbook.snapshots`.
 
-## Implementation Details
-The `KafkaPublisher` struct encapsulates the Confluent Kafka Go client, handling the translation of internal domain models into JSON payloads. By wrapping the producer logic here, the system maintains a clean separation between business rules and messaging protocols.
+---
 
-See **[[index]]** for more information on the overall high-level architecture and how this entity fits within the broader ecosystem.
+## Producer Tuning Parameters
+
+To satisfy ultra-low-latency financial matching requirements while maintaining necessary durability guarantees, the `KafkaPublisher` configures the producer with the following settings:
+
+```go
+p, err := kafka.NewProducer(&kafka.ConfigMap{
+    "bootstrap.servers": brokers,
+    "acks":              "all",
+    "linger.ms":         1, // Optimize for low latency, slight batching
+})
+```
+
+### 1. `acks: "all"` (Durability & Consistency)
+*   **Behavior**: Requires acknowledgment from all in-sync replicas (ISRs) before a produce request is considered successful.
+*   **Rationale**: Financial exchanges cannot tolerate silent message loss on trade executions or market state. Setting `acks` to `all` guarantees that once a trade execution or book snapshot is acknowledged by the producer, it is durably replicated across the Kafka cluster.
+
+### 2. `linger.ms: 1` (Latency vs. Throughput Balance)
+*   **Behavior**: Forces the producer to wait up to 1 millisecond to batch multiple records together before transmitting them over the network.
+*   **Rationale**: Without a linger period, every individual trade fill or book update immediately triggers a distinct network packet, inducing CPU and network context-switching overhead. A 1ms window permits slight batching of high-frequency micro-bursts without introducing perceptible latency into the egress pipeline.
+
+---
+
+## Event Topics & Partitioning Strategy
+
+| Topic Name | Payload Type | Partition Key | Primary Consumers |
+| :--- | :--- | :--- | :--- |
+| `nte.trades.matched` | `models.TradeExecution` | `PartitionAny` (Round-robin / dynamic) | `trade-settlement-system`, `compliance-surveillance-monitor` |
+| `nte.orderbook.snapshots` | `map[string]interface{}` (L2 Depth) | `symbol` (e.g., `BTC/USD`) | `market-data-gateway` |
+
+*   **Symbol Partitioning**: Snapshot events explicitly assign the trading symbol as the Kafka message key (`Key: []byte(symbol)`). This guarantees that updates for a given instrument (such as `BTC/USD`) land on the same partition sequentially, preserving order consistency for downstream market data clients.

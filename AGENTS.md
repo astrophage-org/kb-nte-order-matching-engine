@@ -12,7 +12,7 @@ This repository is an **OpenKB Knowledge Base** for **nte/Order Matching Engine*
 - `.astrophage/brief.md`: Compact architecture digest for prompt injection (<4,000 chars).
 
 ## ⚖️ Invariants & Rules for AI Agents
-1. **Wikilink Syntax**: Use standard Obsidian-compatible `[[path/slug|Title]]` or `[[slug]]` for all internal cross-references.
-2. **Zero Broken Links**: Every `[[wikilink]]` must resolve to an existing file in this vault.
+1. **Wikilink Syntax**: Use standard Obsidian-compatible `[[path/slug|Title]]` or `[[slug]]` for all internal cross-references. For cross-repo links, use `[[kb:app-name/path|Title]]`.
+2. **Zero Broken Links**: Every `[[wikilink]]` must resolve to an existing file in this vault or registered cross-KB repository.
 3. **Append to log.md**: Whenever modifying or adding a page, append a dated entry to `log.md`.
 4. **Preserve Anchors**: Never delete `<!-- anchor: ... -->` comments in summaries or entity pages.
