@@ -1,29 +1,52 @@
-# Architectural Overview: Order Matching System
+# Architectural Overview: Order Matching Engine (OME)
 
-The `Order Matching System` is a high-performance, decoupled engine designed to process and execute financial trades with a primary focus on reliability and thread safety. The system utilizes a layered architecture to strictly separate core domain logic from infrastructure concerns, ensuring that the core matching algorithms remain isolated from external dependencies.
+The **Order Matching Engine (OME)** is a core component of the Global Financial Markets Group (GFMG) Nexus Trading Exchange ecosystem, engineered for high-throughput, microsecond-level performance. 
 
-## Core Components
+For related architectural concepts and component specifications, refer to [[entities/cmd-server-main]], [[entities/internal-matching-engine]], [[entities/internal-matching-order-book]], [[entities/internal-events-kafka-publisher]], [[entities/models-order]], and [[entities/models-trade]].
 
-The system is structured into four primary architectural layers:
+---
 
-1.  **`Orchestration & Lifecycle Layer`**: This serves as the central entry point for the application. It manages the entire lifecycle of the `Order Matching System`, including initialization, the loading of configuration data via ``Configuration Management``, and graceful shutdown procedures. It ensures that all necessary dependencies, such as messaging clients, are fully initialized before the system begins processing orders.
-2.  **`Domain Orchestration Engine`**: Functioning as a multi-book management system, this component acts as the primary router for the application. It maintains state for various trading symbols and routes incoming requests to the appropriate `Order Books` based on specific ticker metadata.
-3.  **`Execution Logic (Order Books)`**: This layer handles the granular mechanics of trade execution. Each order book manages its own bid/ask queues, processes matching logic, and generates trade executions when sufficient liquidity is detected.
-4.  **`Egress & Messaging Gateway`**: To maintain a decoupled architecture, this gateway serves as an abstraction layer for message production. It encapsulates all logic related to the ``Kafka Publisher``, ensuring that internal match events are serialized and broadcasted without exposing the core engine to specific messaging broker protocols.
+## Navigation Table
 
-## Data Flow Pipeline
+| Category | Document | Description |
+| :--- | :--- | :--- |
+| **Summaries** | [[summaries/order-matching-engine]] | High-level OME architectural overview |
+| **Entities** | [[entities/cmd-server-main]] | Server core and process orchestrator |
+| **Entities** | [[entities/internal-matching-engine]] | Matching engine core implementation |
+| **Entities** | [[entities/internal-matching-order-book]] | Order book and price-time priority logic |
+| **Entities** | [[entities/internal-events-kafka-publisher]] | Kafka event publisher for egress |
+| **Entities** | [[entities/models-order]] | Order domain model structure |
+| **Entities** | [[entities/models-trade]] | Trade execution domain model schema |
+| **Concepts** | [[concepts/data-pipeline]] | End-to-end data flow and ingress/egress routing |
+| **Concepts** | [[concepts/iceberg-orders]] | Iceberg order handling and hidden liquidity |
+| **Concepts** | [[concepts/symbol-sharding]] | Symbol sharding and lock contention mitigation |
+| **Decisions** | [[decisions/in-memory-queues]] | In-memory priority queues for microsecond latency |
+| **Decisions** | [[decisions/kafka-durability]] | Resiliency and Kafka-based event log durability |
 
-The system processes data through a linear, event-driven pipeline:
+---
 
-*   **Ingress**: Raw trading requests are captured and mapped into standardized internal models (e.g., Limit or Market orders).
-*   **Routing & Execution**: Orders are passed to the **`Domain Orchestration Engine`**, which identifies the correct book. The order is then processed by the specific **`Execution Logic (Order Books)`**.
-*   **Publication**: Upon a successful match, a "Trade" event is generated and handed off to the **`Egress & Messaging Gateway`**, which broadcasts the data to external systems for downstream processing via Kafka.
+## 1. Main Components
 
-## Architectural Principles
+The system is structured as an in-memory, event-driven matching engine:
 
-The design of the `Order Matching System` is guided by several key principles:
+*   **Server Core & Process Orchestrator (`[[entities/cmd-server-main]]`)**: Initializes logging (`logrus`), establishes Kafka connectivity via [[entities/internal-events-kafka-publisher]], instantiates the matching engine, and manages the lifecycle/graceful shutdown of the exchange node via OS signals. In the current iteration, it also includes a traffic simulation loop for inbound orders (e.g., handling limit and [[concepts/iceberg-orders|iceberg orders]]).
+*   **Matching Core (`[[entities/internal-matching-engine]]` & `[[entities/internal-matching-order-book]]`)**: 
+    *   `Engine`: Orchestrates multi-symbol order matching, maintaining thread-safe, sharded access to symbol-specific order books using a `sync.RWMutex` (see [[concepts/symbol-sharding]]).
+    *   `OrderBook`: Manages [[decisions/in-memory-queues|in-memory priority queues]] for individual symbols (`bids` and `asks`). It evaluates incoming orders against resting liquidity, handles matching logic, and computes partial fills.
+    *   **Iceberg Order Handling**: Automatically fragments large orders, maintaining visible (`DisplayQuantity`) and hidden (`HiddenQuantity`) states, and dynamically replenishing the display tranche as visible segments are filled (see [[concepts/iceberg-orders]]).
+*   **Event Publisher (`[[entities/internal-events-kafka-publisher]]`)**: Interfaces with Apache Kafka using `confluent-kafka-go`. Optimized with `acks=all` and minimal linger times (`linger.ms=1`) to balance durability with ultra-low latency (see [[decisions/kafka-durability]]). Publishes matched trades and order book snapshots.
+*   **Domain Models (`[[entities/models-order]]` & `[[entities/models-trade]]`)**: Define core primitives (`Order`, `TradeExecution`, `Side`, `OrderType`) utilized across ingress, matching, and egress layers.
 
-*   **Decoupling via Abstraction**: By utilizing an abstraction layer for the ``Kafka Publisher``, the core matching logic remains independent of downstream infrastructure changes.
-*   **Thread-Safe Concurrency**: The system is engineered to handle concurrent requests across multiple symbols simultaneously while maintaining integrity in the order books.
-*   **Domain-Driven Design (DDD)**: A clear distinction is maintained between business models (Orders, Trades) and technical infrastructure (Kafka, Config Files).
-*   **Configuration-Driven Architecture**: System behaviors, including exchange rules and environmental endpoints, are managed via a centralized configuration system to allow for high flexibility.
+---
+
+## 2. Data Flows
+
+For the end-to-end data pipeline trace, see [[concepts/data-pipeline]].
+
+1.  **Inbound Ingress**: Orders originate from upstream gateways (simulated via traffic generator or Kafka consumers) containing parameters such as symbol, trader ID, side, type, price, quantity, and iceberg flags.
+2.  **State Routing & Matching**:
+    *   The `Engine` receives the `models.Order`, locking on the specific symbol to retrieve or initialize its `OrderBook`.
+    *   The `OrderBook` evaluates the order against existing book state, executing matching algorithms against available liquidity (generating `models.TradeExecution` records).
+    *   Unfilled portions or resting orders are appended to the appropriate side (`bids` or `asks`).
+3.  **Egress & Downstream Distribution**:
+    *   **Matched Trades**: Emitted to the `nte.trades.matched` Kafka topic for consumption by the Trade Settlement System.
